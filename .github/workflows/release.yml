@@ -1,0 +1,114 @@
+name: Release
+
+# Publishes the `shaders` package from this repo. Publishing is opt-in per run: a real
+# publish needs `confirm_publish: true` AND a trusted publisher configured on npmjs.com
+# for this repository and workflow file. Everything else is a dry run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_publish:
+        description: 'Actually publish to npm (otherwise dry run)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and Publish
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.20.x'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Setup pnpm cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-store-
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Update npm for OIDC support
+        run: |
+          npm install -g npm@^11
+          echo "npm version: $(npm --version)"
+
+      - name: Bump patch version
+        id: version
+        run: |
+          CURRENT_VERSION=$(node -p "require('./packages/shaders/package.json').version")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          NEW_VERSION="$MAJOR.$MINOR.$((PATCH + 1))"
+          echo "Current version: $CURRENT_VERSION -> $NEW_VERSION"
+          node -e "
+            const fs = require('fs');
+            const path = './packages/shaders/package.json';
+            const pkg = JSON.parse(fs.readFileSync(path, 'utf8'));
+            pkg.version = '$NEW_VERSION';
+            fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+          "
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build all packages
+        run: pnpm lib:build --force
+
+      - name: Publish to npm
+        working-directory: packages/shaders
+        run: |
+          if [ "${{ github.event.inputs.confirm_publish }}" == "true" ]; then
+            npm publish --access public
+          else
+            echo "DRY RUN - would publish version ${{ steps.version.outputs.new_version }}"
+            npm publish --access public --dry-run
+          fi
+
+      - name: Configure git
+        if: github.event.inputs.confirm_publish == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Commit version bump
+        if: github.event.inputs.confirm_publish == 'true'
+        run: |
+          git add packages/shaders/package.json
+          git commit -m "chore: bump version to ${{ steps.version.outputs.new_version }} [skip ci]"
+          git push origin main
+
+      - name: Create Release Summary
+        run: |
+          echo "### Release v${{ steps.version.outputs.new_version }} :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.confirm_publish }}" != "true" ]; then
+            echo "**Mode:** DRY RUN (no actual publish)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "**Previous version:** ${{ steps.version.outputs.current_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**New version:** ${{ steps.version.outputs.new_version }}" >> $GITHUB_STEP_SUMMARY
