@@ -284,6 +284,14 @@ export interface GpuFragmentParams {
      */
     props: Expr
     /**
+     * Record that this composition contains USER-AUTHORED WGSL (a `wgsl` body). The renderer
+     * then builds and first-renders the composition inside a validation error scope, so a
+     * body that fails to compile marks only that composition broken instead of tripping the
+     * fatal uncaptured-error limit. Set by the std `wgsl` lowering; hosts without a renderer
+     * (tests, offline resolve) may omit it.
+     */
+    noteCustomWgsl?: () => void
+    /**
      * Per-prop KitExpr accessors (`props.<field>`), keyed by prop name. For builders that
      * reference individual fields (aspect math) rather than the whole struct. Driver-overridden
      * props resolve to the local copy's field.
@@ -534,6 +542,13 @@ export interface GpuShaderDefinition<T extends ComponentProps = ComponentProps> 
     deprecatedNames?: string[]
     category?: string
     description?: string
+    /**
+     * A content fingerprint for definitions that can change WITHOUT changing name — a
+     * user-authored `wgsl` body edited live. The composer folds it into the structural hash, so
+     * swapping in a new definition object under the same name recomposes instead of hitting
+     * the pipeline cache. `defineShader` stamps it for `wgsl` bodies; library shaders omit it.
+     */
+    revision?: string
     requiresRTT?: boolean
     requiresChild?: boolean
     // A GENERATOR (requiresChild falsy) that can OPTIONALLY consume a nested child — it works fully

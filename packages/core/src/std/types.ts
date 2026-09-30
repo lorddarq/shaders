@@ -18,6 +18,7 @@ import type {FilterParams} from '../gpu/scaffolds/pointwiseFilter'
 import type {RttFilterParams} from '../gpu/scaffolds/rttFilter'
 import type {UvMapSource, UvRemapEdgeSource, UvRemapHookParams} from '../gpu/scaffolds/uvRemapShader'
 import type {SdfShapeShaderSpec} from '../gpu/scaffolds/sdfShape'
+import type {WgslBody} from './wgsl'
 
 // ── Slot classification ─────────────────────────────────────────────────────────────────
 
@@ -131,22 +132,38 @@ export interface StdDefinitionBase<T extends ComponentProps> {
     mapSampleUVs?: GpuMapSampleUVs
 }
 
-/** role 'filter' + species 'pointwise' — inline color filter over the composed child. */
+/**
+ * A pointwise filter — inline color filter over the composed child. `role`/`species` are
+ * optional: `effect:` says filter, and the effect's kind says pointwise.
+ */
 export interface StdPointwiseFilterDefinition<T extends ComponentProps> extends StdDefinitionBase<T> {
-    role: 'filter'
-    species: 'pointwise'
-    effect: PointwiseEffect | import('./filter').TintTowardEffect
+    role?: 'filter'
+    species?: 'pointwise'
+    effect: PointwiseEffect | import('./filter').TintTowardEffect | WgslBody
     /** Declared no-op condition; the lowering owns bypass + driver guards. */
     identityWhen?: IdentityRule
     /** User-facing missing-child message; omit for silent (returns transparent). */
     missingChildMessage?: string
 }
 
-/** role 'filter' + species 'gather' — samples the child's render-to-texture. */
+/** A gather filter — samples the child's render-to-texture. `role`/`species` optional (inferred). */
 export interface StdGatherFilterDefinition<T extends ComponentProps> extends StdDefinitionBase<T> {
-    role: 'filter'
-    species: 'gather'
-    effect: GatherEffect | import('./filter').DisplaceByEffect
+    role?: 'filter'
+    species?: 'gather'
+    effect: GatherEffect | import('./filter').DisplaceByEffect | WgslBody
+    identityWhen?: IdentityRule
+    missingChildMessage?: string
+}
+
+/**
+ * role 'filter' with a raw `wgsl` body and NO declared species — the species is inferred
+ * from the body: `gather` when it samples `childTexture`, `pointwise` otherwise. Declare
+ * `species` explicitly to override the inference.
+ */
+export interface StdWgslFilterDefinition<T extends ComponentProps> extends StdDefinitionBase<T> {
+    role?: 'filter'
+    species?: undefined
+    effect: WgslBody
     identityWhen?: IdentityRule
     missingChildMessage?: string
 }
@@ -157,7 +174,7 @@ export interface StdGatherFilterDefinition<T extends ComponentProps> extends Std
  * fragment and the analytic fold — so they cannot drift.
  */
 export interface StdWarpDefinition<T extends ComponentProps> extends StdDefinitionBase<T> {
-    role: 'warp'
+    role?: 'warp'
     map: UvMapSource
     /** Edge handling: `'prop'` (an `edges` prop, default) · a fixed mode · `'none'`. */
     edges?: UvRemapEdgeSource
@@ -170,9 +187,9 @@ export interface StdWarpDefinition<T extends ComponentProps> extends StdDefiniti
 
 /** role 'shape' — an analytic 2D SDF shape (fill + stroke + soften + bounds). */
 export interface StdShapeDefinition {
-    role: 'shape'
+    role?: 'shape'
     name: string
-    description: string
+    description?: string
     category?: string
     shape: Omit<SdfShapeShaderSpec, 'name' | 'description' | 'category'>
 }
@@ -182,8 +199,9 @@ export interface StdShapeDefinition {
  * is the composition builder: the L1 tier for generators whose look is a blessed body fn.
  */
 export interface StdGeneratorDefinition<T extends ComponentProps> extends StdDefinitionBase<T> {
-    role: 'generator'
-    paint: (params: GpuFragmentParams) => Expr
+    role?: 'generator'
+    /** The composition builder, or a raw `wgsl` body returning the pixel color. */
+    paint: ((params: GpuFragmentParams) => Expr) | WgslBody
 }
 
 /**
@@ -192,8 +210,9 @@ export interface StdGeneratorDefinition<T extends ComponentProps> extends StdDef
  * The declarative half stays declared on the base; the GPU half is quarantined in `gpu:`.
  */
 export interface StdCustomDefinition<T extends ComponentProps> extends StdDefinitionBase<T> {
-    role: 'simulation' | 'shapeEffect' | 'media' | 'structural' | 'filter' | 'generator' | 'overlay'
-    species: 'custom'
+    /** A label for the kind of thing this is (documentation; nothing downstream reads it). */
+    role?: 'simulation' | 'shapeEffect' | 'media' | 'structural' | 'filter' | 'generator' | 'overlay'
+    species?: 'custom'
     requiresRTT?: boolean
     requiresChild?: boolean
     gpu: {
@@ -202,10 +221,16 @@ export interface StdCustomDefinition<T extends ComponentProps> extends StdDefini
     }
 }
 
-/** The std definition union — one member per role/species. */
+/**
+ * The std definition union — one member per role/species. The role is INFERRED from the
+ * field that carries the GPU half: `paint:` → generator, `effect:` → filter (species from the
+ * effect), `map:` → warp, `shape:` → shape, `gpu:` → custom. `role`/`species` may still be
+ * declared; a declaration that contradicts the shape is an error at definition time.
+ */
 export type StdDefinition<T extends ComponentProps> =
     | StdPointwiseFilterDefinition<T>
     | StdGatherFilterDefinition<T>
+    | StdWgslFilterDefinition<T>
     | StdWarpDefinition<T>
     | StdShapeDefinition
     | StdGeneratorDefinition<T>

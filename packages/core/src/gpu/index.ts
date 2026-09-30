@@ -25,7 +25,7 @@ import type {TgpuRoot} from 'typegpu'
 import * as d from 'typegpu/data'
 
 import {acquireRoot, configureCanvasContext, type RootContext} from './root'
-import {debugError, getGpuUnusableReason, isGpuUnavailableError, markGpuUnusable, type GpuFailureReason} from './support'
+import {debugError, getGpuUnusableReason, isGpuUnavailableError, markGpuUnusable, type GpuFailureReason, authorError} from './support'
 import {createUniformStore, updateFieldValue, FieldHandle, ArrayFieldHandle, type UniformStore, type NodeHandles, type FieldInit} from './uniformStore'
 import {SystemUniforms} from './kit/coords'
 import {getAnimatedTimeState} from './kit/time'
@@ -250,6 +250,16 @@ interface BuiltComposition {
     handlesById: Map<string, NodeHandles>
     /** True on the first getOrBuild that created it (skip re-seed); cleared after binding. */
     fresh: boolean
+    /**
+     * Frames left in the validation window. While a custom WGSL body is in play, the first
+     * frames of a fresh composition render inside a validation error scope; a captured error
+     * marks the composition `broken` (nothing draws until the structure changes) instead of
+     * counting toward the fatal uncaptured-error limit — an author's typo must not stop the
+     * renderer for good.
+     */
+    validationFrames: number
+    /** The GPU validation message that broke this composition, when it did. */
+    broken?: string
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
@@ -1441,11 +1451,38 @@ export function shaderRendererGPU() {
         const registry = buildRegistryView(store, handlesById)
         const ir = composeNodeTree(registry, composeOptions())
         const pm = createPassManager(root, {textureManager, dispatcher})
-        pm.setComposition(ir, store.bindGroup, bufferSize(), mediaResourcesFromIr(ir))
-
-        const bc: BuiltComposition = {hash, store, ir, passManager: pm, handlesById, fresh: true}
+        // A composition carrying user-authored WGSL builds its pipelines inside a validation
+        // scope: a body that fails to compile marks THIS composition broken (nothing draws until
+        // the structure changes) instead of counting toward the fatal uncaptured-error limit.
+        // The first frames render inside a scope too (see `render`), since a pipeline may only
+        // be realised on first use.
+        const bc: BuiltComposition = {hash, store, ir, passManager: pm, handlesById, fresh: true, validationFrames: 3}
+        const device = ir.usesCustomWgsl ? root.device : undefined
+        if (device) device.pushErrorScope('validation')
+        try {
+            pm.setComposition(ir, store.bindGroup, bufferSize(), mediaResourcesFromIr(ir))
+        } finally {
+            // Pop in `finally`: a synchronous throw above must not leave the scope open (it would
+            // swallow every later validation error on the device and unbalance the scope stack).
+            if (device) {
+                device.popErrorScope().then((error) => {
+                    if (error && !bc.broken) markBroken(bc, error.message)
+                }).catch(() => {
+                    /* device lost mid-build — the loss handler owns recovery */
+                })
+            }
+        }
         liveCompositions.add(bc)
         return bc
+    }
+
+    /** Record a validation failure against one composition and tell the author once. */
+    const markBroken = (bc: BuiltComposition, message: string): void => {
+        bc.broken = message
+        authorError(
+            '[gpu] a shader in this composition failed GPU validation — it will not draw until it changes. ' +
+            'If you are writing a wgsl`…` body, the message below points at the line:\n' + message,
+        )
     }
 
     const disposeComposition = (bc: BuiltComposition): void => {
@@ -2379,10 +2416,28 @@ export function shaderRendererGPU() {
                 render: () => {
                     if (enablePerformanceTracking) performance.mark('shader-gpu-start')
                     renderComp = pipelineCache.renderValue ?? built
-                    // afterCompute: re-flush field patches written during compute-node collection
-                    // (setExtraField) so they reach the GPU before this frame's passes encode —
-                    // see passManager.render's comment (one-frame _vf* domain mismatch otherwise).
-                    renderComp?.passManager.render(context, frameParams, () => boundComposition?.store.flush())
+                    // A composition a custom WGSL body broke draws nothing (the last good frame
+                    // stays up) until the structure — a fixed body, a new revision — changes.
+                    if (renderComp?.broken) return false
+                    const comp = renderComp
+                    const scopeDevice = comp && comp.validationFrames > 0 && comp.ir.usesCustomWgsl ? root?.device : undefined
+                    if (scopeDevice) scopeDevice.pushErrorScope('validation')
+                    try {
+                        // afterCompute: re-flush field patches written during compute-node collection
+                        // (setExtraField) so they reach the GPU before this frame's passes encode —
+                        // see passManager.render's comment (one-frame _vf* domain mismatch otherwise).
+                        comp?.passManager.render(context, frameParams, () => boundComposition?.store.flush())
+                    } finally {
+                        // Pop in `finally` so a throwing frame cannot leave the scope open.
+                        if (scopeDevice && comp) {
+                            comp.validationFrames--
+                            scopeDevice.popErrorScope().then((error) => {
+                                if (error && !comp.broken) markBroken(comp, error.message)
+                            }).catch(() => {
+                                /* device lost mid-frame — the loss handler owns recovery */
+                            })
+                        }
+                    }
                     if (enablePerformanceTracking) {
                         performance.mark('shader-gpu-end')
                         try {
@@ -2693,7 +2748,7 @@ export function shaderRendererGPU() {
             return
         }
         consecutiveRenderErrors++
-        if (consecutiveRenderErrors === 1) debugError('[gpu] render error:', error)
+        if (consecutiveRenderErrors === 1) authorError('[gpu] render error:', error)
         if (consecutiveRenderErrors >= MAX_CONSECUTIVE_RENDER_ERRORS) fail('render-failed', error)
     }
 
@@ -2724,7 +2779,7 @@ export function shaderRendererGPU() {
                 /* non-cancelable in some polyfills — nothing else we can do */
             }
             const gpuError = (event as {error?: unknown}).error
-            debugError('[gpu] uncaptured device error:', gpuError)
+            authorError('[gpu] uncaptured device error (a custom WGSL body that fails to compile reports here — read the message for the line):', gpuError)
             if (typeof GPUOutOfMemoryError !== 'undefined' && gpuError instanceof GPUOutOfMemoryError) {
                 fail('out-of-memory', gpuError)
                 return

@@ -26,8 +26,11 @@ import type {
     StdProps,
     StdShapeDefinition,
     StdWarpDefinition,
+    StdWgslFilterDefinition,
 } from './types'
 import {resolveScalar, uniformOf} from './invoke'
+import {isWgslBody, lowerWgsl} from './wgsl'
+import {Scalar} from './values'
 
 // ── Props ───────────────────────────────────────────────────────────────────────────────
 
@@ -116,13 +119,39 @@ function lowerPointwiseFilter<T extends ComponentProps>(definition: StdPointwise
             args: (params) => [uniformOf(color, params), resolveScalar(amount, params)],
         })
     }
+    if (isWgslBody(effect)) {
+        return definePointwiseFilter<T>({
+            ...shared,
+            build: lowerWgsl(effect, 'pointwise', wgslHost(definition)),
+        })
+    }
     const {kind: _kind, ...effectConfig} = effect
     return definePointwiseFilter<T>({...shared, ...effectConfig})
 }
 
+/** What a `wgsl` body needs from its definition to bind props and the time clock. */
+function wgslHost<T extends ComponentProps>(definition: {name: string; props: StdProps<T>; animatedTime?: {speed: string}}) {
+    return {
+        name: definition.name,
+        props: definition.props as unknown as Record<string, PropConfig<unknown>>,
+        animatedTime: definition.animatedTime,
+    }
+}
+
+
 function lowerGatherFilter<T extends ComponentProps>(definition: StdGatherFilterDefinition<T>): GpuShaderDefinition<T> {
     const {role: _role, species: _species, effect, identityWhen, missingChildMessage, props, ...meta} = definition
     if (effect.kind === 'displaceBy') return lowerDisplaceBy(definition)
+    if (isWgslBody(effect)) {
+        return defineRttFilter<T>({
+            ...meta,
+            props: lowerProps(props),
+            identity: lowerIdentity(identityWhen, props),
+            missingChildMessage,
+            build: lowerWgsl(effect, 'gather', wgslHost(definition)),
+            resultAlpha: effect.spec.alpha ?? 'premultiplied',
+        })
+    }
     const {kind: _kind, ...effectConfig} = effect
     return defineRttFilter<T>({
         ...meta,
@@ -231,6 +260,16 @@ function lowerShape<T extends ComponentProps>(definition: StdShapeDefinition): G
 
 function lowerGenerator<T extends ComponentProps>(definition: StdGeneratorDefinition<T>): GpuShaderDefinition<T> {
     const {role: _role, paint, props, ...meta} = definition
+    if (isWgslBody(paint)) {
+        // A wgsl body already reads the distorted UV when a parent supplies one; accepting UV
+        // context by default is what makes that happen inside a library distortion.
+        return {
+            acceptsUVContext: true,
+            ...meta,
+            props: lowerProps(props),
+            fragment: lowerWgsl(paint, 'generator', wgslHost(definition)),
+        }
+    }
     return {
         ...meta,
         props: lowerProps(props),
@@ -250,16 +289,162 @@ function lowerCustom<T extends ComponentProps>(definition: StdCustomDefinition<T
 
 // ── Entry ───────────────────────────────────────────────────────────────────────────────
 
+/**
+ * A small stable fingerprint (FNV-1a) of the `wgsl` bodies a definition carries, so a
+ * live-edited body under an unchanged name still recomposes (see `GpuShaderDefinition.revision`).
+ */
+function wgslRevision(definition: StdDefinition<unknown & ComponentProps>): string | undefined {
+    const bodies: string[] = []
+    const paint = (definition as {paint?: unknown}).paint
+    const effect = (definition as {effect?: unknown}).effect
+    for (const candidate of [paint, effect]) {
+        if (isWgslBody(candidate)) bodies.push(candidate.spec.body, serializeInputs(candidate.spec.inputs ?? {}), candidate.spec.alpha ?? '')
+    }
+    if (bodies.length === 0) return undefined
+    let h = 0x811c9dc5
+    for (const ch of bodies.join('\u0000')) {
+        h ^= ch.charCodeAt(0)
+        h = Math.imul(h, 0x01000193) >>> 0
+    }
+    return h.toString(16)
+}
+
+/**
+ * A stable text form of a body's explicit inputs — each binding's value AND declared type —
+ * so changing what a name is bound to (`k: 4` → `k: 5`, `t: ctx.time` → `t: p('phase')`)
+ * yields a new revision. Keys are sorted; a signal graph serializes by kind (its build fn
+ * has no stable text, and signals are created per definition anyway).
+ */
+function serializeInputs(inputs: Record<string, unknown>): string {
+    const scalarNode = (node: unknown): string => {
+        if (typeof node !== 'object' || node === null) return String(node)
+        const n = node as {kind: string; name?: string; a?: unknown; b?: unknown; center?: {name: string}; radius?: {name: string}; falloff?: {name: string}}
+        switch (n.kind) {
+            case 'prop': return `p:${n.name}`
+            case 'ctx': return `c:${n.name}`
+            case 'mul': return `mul(${scalarNode(n.a)},${scalarNode(n.b)})`
+            case 'radialMask': return `radialMask(${n.center?.name},${n.radius?.name},${n.falloff?.name})`
+            default: return n.kind
+        }
+    }
+    const spec = (value: unknown): string => {
+        if (typeof value === 'number') return `n:${value}`
+        if (value instanceof Scalar) return `s:${scalarNode(value.node)}`
+        return scalarNode(value)
+    }
+    return Object.keys(inputs).sort().map((key) => {
+        const input = inputs[key]
+        const typed = input !== null && typeof input === 'object' && 'value' in (input as object) && 'type' in (input as object)
+        return typed
+            ? `${key}=${spec((input as {value: unknown}).value)}:${(input as {type: string}).type}`
+            : `${key}=${spec(input)}`
+    }).join(',')
+}
+
+// ── Prop-name validation ────────────────────────────────────────────────────────────────
+
+/**
+ * Names every framework component owns as LAYER props: a shader prop spelled the same could
+ * never be set (the component consumes it first), so it is rejected at definition time.
+ */
+const LAYER_PROP_NAMES = new Set([
+    'blendMode', 'opacity', 'visible', 'id', 'maskSource', 'maskType', 'renderOrder',
+    'transform', 'boundingBox', 'flow', 'absolute', 'children', 'ref', 'key',
+    // How <CustomShader> receives the definition itself.
+    'src',
+])
+
+/** Names the renderer registers as synthetic per-node fields (never authored). */
+const SYNTHETIC_PROP_NAMES = new Set(['_animTime', '_opacity'])
+const SYNTHETIC_PROP_PREFIXES = ['_pad', '_bbox_', '_map_', '_childBounds_', '_animTime_']
+
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+function validatePropNames(name: string, props: Record<string, unknown>): void {
+    for (const prop of Object.keys(props)) {
+        if (!IDENTIFIER.test(prop)) {
+            throw new Error(`defineShader("${name}"): prop '${prop}' is not a valid identifier (letters, digits and _ only, not starting with a digit)`)
+        }
+        if (LAYER_PROP_NAMES.has(prop)) {
+            throw new Error(`defineShader("${name}"): '${prop}' is a layer prop every component already has (blend mode, opacity, layout, …) — rename the shader prop`)
+        }
+        if (SYNTHETIC_PROP_NAMES.has(prop) || SYNTHETIC_PROP_PREFIXES.some((prefix) => prop.startsWith(prefix))) {
+            throw new Error(`defineShader("${name}"): '${prop}' collides with a field the renderer manages itself — rename the shader prop`)
+        }
+    }
+}
+
 /** Lower a std definition to the engine contract. */
 export function defineStd<T extends ComponentProps>(definition: StdDefinition<T>): GpuShaderDefinition<T> {
-    if (definition.role === 'shape') return lowerShape(definition)
-    if (definition.role === 'warp') return lowerWarp(definition)
-    if (definition.role === 'generator' && !('species' in definition)) return lowerGenerator(definition)
-    if ('species' in definition) {
-        if (definition.species === 'pointwise') return lowerPointwiseFilter(definition)
-        if (definition.species === 'gather') return lowerGatherFilter(definition)
-        if (definition.species === 'custom') return lowerCustom(definition)
-    }
-    const {role} = definition as {role: string}
-    throw new Error(`std: unsupported definition shape for role '${role}'`)
+    if ('props' in definition && definition.props) validatePropNames(definition.name, definition.props as Record<string, unknown>)
+    const lowered = lowerStd(definition)
+    const revision = wgslRevision(definition as StdDefinition<ComponentProps>)
+    return revision ? {...lowered, revision} : lowered
 }
+
+type InferredRole = 'shape' | 'warp' | 'custom' | 'generator' | 'filter'
+
+/**
+ * The role a definition has, from the field carrying its GPU half. A declared `role` may
+ * restate it (the library's shaders do) but cannot contradict it: the field IS the role.
+ */
+function inferRole(definition: Record<string, unknown>): InferredRole {
+    const inferred: InferredRole | null =
+        'shape' in definition ? 'shape'
+        : 'map' in definition ? 'warp'
+        : 'gpu' in definition ? 'custom'
+        : 'paint' in definition ? 'generator'
+        : 'effect' in definition ? 'filter'
+        : null
+    const name = String(definition.name ?? '?')
+    if (!inferred) {
+        throw new Error(`defineShader("${name}"): give it a GPU half — paint: (generator), effect: (filter), map: (warp), shape: (shape) or gpu: (custom)`)
+    }
+    const declared = definition.role as string | undefined
+    // Custom-tier roles are labels (simulation, media, …) and can sit on a `gpu:` definition.
+    if (declared && inferred !== 'custom' && declared !== inferred) {
+        throw new Error(`defineShader("${name}"): role '${declared}' contradicts its ${FIELD_FOR_ROLE[inferred]} field (a ${inferred})`)
+    }
+    return inferred
+}
+
+const FIELD_FOR_ROLE: Record<InferredRole, string> = {shape: 'shape:', warp: 'map:', custom: 'gpu:', generator: 'paint:', filter: 'effect:'}
+
+/** The species a filter effect implies; a declared species must agree unless the effect is raw WGSL. */
+function inferSpecies<T extends ComponentProps>(
+    definition: StdPointwiseFilterDefinition<T> | StdGatherFilterDefinition<T> | StdWgslFilterDefinition<T>,
+): 'pointwise' | 'gather' {
+    const {effect, species} = definition
+    if (isWgslBody(effect)) return species ?? (effect.samplesChild ? 'gather' : 'pointwise')
+    const implied: 'pointwise' | 'gather' = effect.kind === 'gather' || effect.kind === 'displaceBy' ? 'gather' : 'pointwise'
+    if (species && species !== implied) {
+        throw new Error(`defineShader("${definition.name}"): species '${species}' contradicts its '${effect.kind}' effect (${implied})`)
+    }
+    return implied
+}
+
+function lowerStd<T extends ComponentProps>(definition: StdDefinition<T>): GpuShaderDefinition<T> {
+    switch (inferRole(definition as unknown as Record<string, unknown>)) {
+        case 'shape':
+            return lowerShape(definition as StdShapeDefinition)
+        case 'warp':
+            return lowerWarp(definition as StdWarpDefinition<T>)
+        case 'custom':
+            return lowerCustom(definition as StdCustomDefinition<T>)
+        case 'generator':
+            return lowerGenerator(definition as StdGeneratorDefinition<T>)
+        case 'filter': {
+            const filter = definition as StdPointwiseFilterDefinition<T> | StdGatherFilterDefinition<T> | StdWgslFilterDefinition<T>
+            return inferSpecies(filter) === 'gather'
+                ? lowerGatherFilter({...filter, species: 'gather'} as StdGatherFilterDefinition<T>)
+                : lowerPointwiseFilter({...filter, species: 'pointwise'} as StdPointwiseFilterDefinition<T>)
+        }
+    }
+}
+
+/**
+ * Define a shader component. The public name of {@link defineStd}: a declarative definition
+ * (props, role, the paint or effect) lowered to the engine contract, ready for
+ * `<CustomShader src={…}>` in any framework, `registerShader`, or a `createShader` preset.
+ */
+export const defineShader: typeof defineStd = defineStd
