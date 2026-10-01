@@ -1,12 +1,11 @@
 /**
- * `@coreroot/std` — the standard authoring layer for shader definitions.
+ * `shaders/std` — the authoring layer for shader definitions.
  *
- * A shader definition authored on std is declarative data built from these constructors;
- * `defineStd` lowers it onto the engine scaffolds and kit primitives and returns an
- * ordinary `GpuShaderDefinition` — registry generation, framework components, editor
- * metadata and presets are all untouched. GPU math lives in the kit behind the nouns; the
- * per-species L1 tiers (`pointwise`, `gather`, a warp's map fn, a generator's paint
- * builder) carry blessed bespoke bodies where the vocabulary does not reach yet.
+ * A definition is a plain object handed to `defineShader`: a name, its props, and one field
+ * that says what it draws (`paint:`, `effect:`, `map:` or `shape:`), written either from the
+ * words exported here or as a raw `wgsl` body. `defineShader` compiles it to an ordinary
+ * engine definition, so registry generation, framework components, editor metadata and
+ * presets all work unchanged. The GPU math behind each word lives in `src/gpu/kit`.
  */
 export {defineStd, defineShader} from './lower'
 export {wgsl, WgslBody, isWgslBody, scanIdentifiers, wgslTypeForProp} from './wgsl'
@@ -78,6 +77,15 @@ export * as effects from './effects/index'
 export * as sim from './sim/index'
 export {layered, layers} from './paint/compose'
 export {paintFrame, resolveArgIn} from './invoke'
+
+// Calling a GPU word directly. Some words (fracture geometry, edge-glow accumulators) are GPU
+// functions rather than builders; `call(fn, name, args)` invokes one from a hand-written
+// `paint:` and returns the expression. `expr` splices a WGSL snippet; `ZERO` is transparent black.
+export {call, expr, asLocal, ZERO, WHITE0} from '../gpu/composer'
+export type {KitTexture, EmitContext} from '../gpu/contract'
+
+// Shared prop blocks the library standardises, for definitions that adopt the same controls.
+export {reliefStylizeProps} from '../utilities/noiseStylize'
 
 // List (array) props: declare with `listPropConfig`, read with `listOf` + `accumulate`.
 export {listOf, accumulate} from './lists'
